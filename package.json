@@ -1,5 +1,5 @@
 {
-  "name": "redis-op",
+  "name": "redis-ops",
   "type": "module",
   "version": "1.0.0",
   "description": "",
@@ -10,9 +10,13 @@
     "redis-op": "./dist/cli.mjs",
     "redis-migrate": "./dist/cli.mjs"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "dev": "tsx src/cli.ts",
     "build": "tsdown src/cli.ts --format esm --platform node --outfile=dist/cli.mjs",
+    "prepack": "npm run build",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "typecheck": "tsc --noEmit",
