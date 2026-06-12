@@ -1,5 +1,5 @@
 {
-  "name": "redis-migrate",
+  "name": "redis-op",
   "type": "module",
   "version": "1.0.0",
   "description": "",
@@ -7,11 +7,12 @@
   "license": "ISC",
   "keywords": [],
   "bin": {
-    "redis-migrate": "./dist/cli.js"
+    "redis-op": "./dist/cli.mjs",
+    "redis-migrate": "./dist/cli.mjs"
   },
   "scripts": {
     "dev": "tsx src/cli.ts",
-    "build": "tsdown build src/cli.ts --format cjs --platform node --outfile=dist/cli.js",
+    "build": "tsdown src/cli.ts --format esm --platform node --outfile=dist/cli.mjs",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "typecheck": "tsc --noEmit",

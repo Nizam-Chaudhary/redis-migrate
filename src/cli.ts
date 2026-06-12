@@ -1,29 +1,30 @@
 #!/usr/bin/env node
 
 /**
- * redis-migrate - Migrate Redis keys from a source Redis instance to a destination instance.
+ * redis-op - Redis data operations for migrating, exporting, and restoring keys.
  *
  * Features:
- *  - CLI with options
- *  - Colorful logging (Signale)
- *  - Progress bars (cli-progress)
- *  - Per-type counts and summary
- *  - Concurrency-limited parallel migration
- *  - SCAN streaming for large DBs (default)
- *
- * Usage:
- *  ts-node redis-migrate.ts -s redis://src:6379 -d redis://dst:6379 -k "user:*" -c 20
- *  OR (after compile) ./redis-migrate -s ... -d ... -k "prefix:*"
+ *  - Migrate Redis keys from one instance to another
+ *  - Export Redis keys to streaming NDJSON
+ *  - Restore NDJSON exports to Redis
+ *  - Per-type counts and summaries
+ *  - Concurrency-limited workers
+ *  - SCAN streaming for large DBs by default
  */
 
 import { MultiBar, Presets } from "cli-progress";
+import { once } from "node:events";
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as process from "node:process";
+import * as readline from "node:readline";
 import redis from "redis";
-import { Signale } from "signale";
+import signale from "signale";
+
+const { Signale } = signale;
 
 const logger = new Signale({
-  scope: "redis-migrate",
+  scope: "redis-op",
   types: {
     migrate: { color: "cyan", label: "migrating", badge: "🚚" },
     done: { color: "green", label: "done", badge: "✨" },
@@ -32,122 +33,81 @@ const logger = new Signale({
   },
 });
 
-// ---------- Types ----------
-interface CliOptions {
+type RedisClient = ReturnType<typeof redis.createClient>;
+
+type Command = "migrate" | "export" | "restore";
+
+interface BaseOptions {
+  command: Command;
+  concurrency: number;
+}
+
+interface MigrateOptions extends BaseOptions {
+  command: "migrate";
   source: string;
   dest: string;
-  keys: string; // glob pattern
-  concurrency: number;
+  keys: string;
   useScan: boolean;
 }
 
-interface Summmary {
+interface ExportOptions extends BaseOptions {
+  command: "export";
+  source: string;
+  output: string;
+  keys: string;
+  useScan: boolean;
+}
+
+interface RestoreOptions extends BaseOptions {
+  command: "restore";
+  dest: string;
+  input: string;
+}
+
+type CliOptions = MigrateOptions | ExportOptions | RestoreOptions;
+
+type ExportRecord =
+  | {
+      version: 1;
+      key: string;
+      type: "string";
+      ttl: number;
+      value: string | null;
+    }
+  | { version: 1; key: string; type: "list"; ttl: number; value: string[] }
+  | {
+      version: 1;
+      key: string;
+      type: "hash";
+      ttl: number;
+      value: Record<string, string>;
+    }
+  | { version: 1; key: string; type: "set"; ttl: number; value: string[] }
+  | {
+      version: 1;
+      key: string;
+      type: "zset";
+      ttl: number;
+      value: Array<{ value: string; score: number }>;
+    }
+  | { version: 1; key: string; type: "ReJSON-RL"; ttl: number; value: unknown };
+
+interface OperationSummary {
   totalScanned: number;
-  totalMigrated: number;
+  totalProcessed: number;
+  skipped: number;
   failures: number;
   byType: Map<string, number>;
 }
 
-// ---------- Helpers ----------
-function printHelp(): void {
-  logger.log(`
-Usage:
-  redis-migrate -s <source_url> -d <dest_url> [-k "<pattern>"] [-c <concurrency>] [--no-scan]
-
-Options:
-  -s, --source     Source Redis connection URL (required)
-  -d, --dest       Destination Redis connection URL (required)
-  -k, --keys       Redis key pattern (default: "*")
-  -c, --concurrency Number of parallel workers (default: 10)
-  --no-scan        Use KEYS (single call) instead of SCAN streaming
-  -h, --help       Show this help message
-
-Examples:
-  redis-migrate -s redis://localhost:6379 -d redis://localhost:6380
-  redis-migrate -s redis://a -d redis://b -k "session:*" -c 20
-`);
+interface RestoreSummary {
+  totalRecords: number;
+  totalRestored: number;
+  failures: number;
+  skippedEmpty: number;
+  byType: Map<string, number>;
 }
 
-function exitWithHelp(): never {
-  printHelp();
-  process.exit(1);
-}
-
-function parseArgs(argv: string[]): CliOptions {
-  const args = argv.slice(2);
-  let source: string | undefined;
-  let dest: string | undefined;
-  let keys = "*";
-  let concurrency = 10;
-  let useScan = true;
-
-  for (let i = 0; i < args.length; i++) {
-    const a = args[i];
-    if (!a) continue;
-    switch (a) {
-      case "-s":
-      case "--source": {
-        const val = args[++i];
-        if (!val) {
-          logger.error("❌ Missing value for -s/--source");
-          exitWithHelp();
-        }
-        source = val;
-        break;
-      }
-      case "-d":
-      case "--dest": {
-        const val = args[++i];
-        if (!val) {
-          logger.error("❌ Missing value for -d/--dest");
-          exitWithHelp();
-        }
-        dest = val;
-        break;
-      }
-      case "-k":
-      case "--keys": {
-        const val = args[++i];
-        if (!val) {
-          logger.error("❌ Missing value for -k/--keys");
-          exitWithHelp();
-        }
-        keys = val;
-        break;
-      }
-      case "-c":
-      case "--concurrency": {
-        const val = args[++i];
-        if (!val || Number.isNaN(Number(val)) || Number(val) <= 0) {
-          logger.error("❌ Invalid value for -c/--concurrency");
-          exitWithHelp();
-        }
-        concurrency = Number(val);
-        break;
-      }
-      case "--no-scan":
-        useScan = false;
-        break;
-      case "-h":
-      case "--help":
-        printHelp();
-        process.exit(0);
-        break;
-      default:
-        logger.error(`❌ Unknown argument: ${a}`);
-        exitWithHelp();
-    }
-  }
-
-  if (!source || !dest) {
-    logger.error("❌ Both --source and --dest are required.");
-    exitWithHelp();
-  }
-
-  return { source, dest, keys, concurrency, useScan };
-}
-
-// ---------- AsyncQueue for Producer/Consumer ----------
 class AsyncQueue<T> {
   private buffer: T[] = [];
   private resolvers: ((value: T | null) => void)[] = [];
@@ -155,27 +115,24 @@ class AsyncQueue<T> {
 
   push(item: T) {
     if (this.closed) throw new Error("Cannot push to closed queue");
-    if (this.resolvers.length > 0) {
-      const r = this.resolvers.shift()!;
-      r(item);
-    } else {
-      this.buffer.push(item);
+    const resolver = this.resolvers.shift();
+    if (resolver) {
+      resolver(item);
+      return;
     }
+    this.buffer.push(item);
   }
 
   close() {
     this.closed = true;
-    // resolve any waiters with null to signal end
     while (this.resolvers.length > 0) {
-      const r = this.resolvers.shift()!;
-      r(null);
+      this.resolvers.shift()!(null);
     }
   }
 
   async shift(): Promise<T | null> {
-    if (this.buffer.length > 0) {
-      return this.buffer.shift()!;
-    }
+    const buffered = this.buffer.shift();
+    if (buffered !== undefined) return buffered;
     if (this.closed) return null;
     return await new Promise<T | null>((resolve) => {
       this.resolvers.push(resolve);
@@ -183,30 +140,401 @@ class AsyncQueue<T> {
   }
 }
 
-// ---------- Redis Migration Logic ----------
-async function migrateRedis(opts: CliOptions): Promise<void> {
-  const sourceClient = redis.createClient({ url: opts.source });
-  const destinationClient = redis.createClient({ url: opts.dest });
+function printHelp(command?: Command): void {
+  if (command === "migrate") {
+    logger.log(`
+Usage:
+  redis-op migrate -s <source_url> -d <dest_url> [-k "<pattern>"] [-c <concurrency>] [--no-scan]
+  redis-op -s <source_url> -d <dest_url> [-k "<pattern>"] [-c <concurrency>] [--no-scan]
 
-  sourceClient.on("error", (e) => logger.error("Source Redis error:", e));
-  destinationClient.on("error", (e) =>
-    logger.error("Destination Redis error:", e),
-  );
+Options:
+  -s, --source       Source Redis connection URL (required)
+  -d, --dest         Destination Redis connection URL (required)
+  -k, --keys         Redis key pattern (default: "*")
+  -c, --concurrency  Number of parallel workers (default: 10)
+  --no-scan          Use KEYS (single call) instead of SCAN streaming
+  -h, --help         Show this help message
+`);
+    return;
+  }
 
-  logger.info(`Connecting to source: ${opts.source}`);
-  logger.info(`Connecting to dest:   ${opts.dest}`);
+  if (command === "export") {
+    logger.log(`
+Usage:
+  redis-op export -s <source_url> -o <output_file.ndjson> [-k "<pattern>"] [-c <concurrency>] [--no-scan]
 
-  await sourceClient.connect();
-  await destinationClient.connect();
+Options:
+  -s, --source       Source Redis connection URL (required)
+  -o, --output       Output NDJSON file path (required)
+  -k, --keys         Redis key pattern (default: "*")
+  -c, --concurrency  Number of parallel workers (default: 10)
+  --no-scan          Use KEYS (single call) instead of SCAN streaming
+  -h, --help         Show this help message
+`);
+    return;
+  }
 
-  const summary: Summmary = {
+  if (command === "restore") {
+    logger.log(`
+Usage:
+  redis-op restore -d <dest_url> -i <input_file.ndjson> [-c <concurrency>]
+
+Options:
+  -d, --dest         Destination Redis connection URL (required)
+  -i, --input        Input NDJSON file path (required)
+  -c, --concurrency  Number of parallel workers (default: 10)
+  -h, --help         Show this help message
+`);
+    return;
+  }
+
+  logger.log(`
+Usage:
+  redis-op migrate -s <source_url> -d <dest_url> [-k "<pattern>"] [-c <concurrency>] [--no-scan]
+  redis-op export -s <source_url> -o <output_file.ndjson> [-k "<pattern>"] [-c <concurrency>] [--no-scan]
+  redis-op restore -d <dest_url> -i <input_file.ndjson> [-c <concurrency>]
+
+Legacy alias:
+  redis-migrate -s <source_url> -d <dest_url> [-k "<pattern>"] [-c <concurrency>] [--no-scan]
+
+Commands:
+  migrate   Copy keys directly from one Redis instance to another
+  export    Export Redis keys to streaming NDJSON
+  restore   Restore a streaming NDJSON export to Redis
+
+Run "redis-op <command> --help" for command-specific options.
+`);
+}
+
+function exitWithHelp(command?: Command): never {
+  printHelp(command);
+  process.exit(1);
+}
+
+function parsePositiveNumber(value: string | undefined): number {
+  if (!value || Number.isNaN(Number(value)) || Number(value) <= 0) {
+    logger.error("❌ Invalid value for -c/--concurrency");
+    exitWithHelp();
+  }
+  return Number(value);
+}
+
+function readOptionValue(
+  args: string[],
+  index: number,
+  option: string,
+): string {
+  const value = args[index + 1];
+  if (!value) {
+    logger.error(`❌ Missing value for ${option}`);
+    exitWithHelp();
+  }
+  return value;
+}
+
+function parseArgs(argv: string[]): CliOptions {
+  const args = argv.slice(2);
+  const first = args[0];
+  const command: Command =
+    first === "migrate" || first === "export" || first === "restore"
+      ? first
+      : "migrate";
+  const commandArgs = command === first ? args.slice(1) : args;
+
+  if (commandArgs.includes("-h") || commandArgs.includes("--help")) {
+    printHelp(command === first ? command : undefined);
+    process.exit(0);
+  }
+
+  let source: string | undefined;
+  let dest: string | undefined;
+  let input: string | undefined;
+  let output: string | undefined;
+  let keys = "*";
+  let concurrency = 10;
+  let useScan = true;
+
+  for (let i = 0; i < commandArgs.length; i++) {
+    const arg = commandArgs[i];
+    if (!arg) continue;
+
+    switch (arg) {
+      case "-s":
+      case "--source":
+        source = readOptionValue(commandArgs, i, arg);
+        i++;
+        break;
+      case "-d":
+      case "--dest":
+        dest = readOptionValue(commandArgs, i, arg);
+        i++;
+        break;
+      case "-i":
+      case "--input":
+        input = readOptionValue(commandArgs, i, arg);
+        i++;
+        break;
+      case "-o":
+      case "--output":
+        output = readOptionValue(commandArgs, i, arg);
+        i++;
+        break;
+      case "-k":
+      case "--keys":
+        keys = readOptionValue(commandArgs, i, arg);
+        i++;
+        break;
+      case "-c":
+      case "--concurrency":
+        concurrency = parsePositiveNumber(commandArgs[++i]);
+        break;
+      case "--no-scan":
+        useScan = false;
+        break;
+      default:
+        logger.error(`❌ Unknown argument: ${arg}`);
+        exitWithHelp(command);
+    }
+  }
+
+  if (command === "migrate") {
+    if (!source || !dest) {
+      logger.error("❌ Both --source and --dest are required for migrate.");
+      exitWithHelp(command);
+    }
+    return { command, source, dest, keys, concurrency, useScan };
+  }
+
+  if (command === "export") {
+    if (!source || !output) {
+      logger.error("❌ Both --source and --output are required for export.");
+      exitWithHelp(command);
+    }
+    return { command, source, output, keys, concurrency, useScan };
+  }
+
+  if (!dest || !input) {
+    logger.error("❌ Both --dest and --input are required for restore.");
+    exitWithHelp(command);
+  }
+
+  return { command, dest, input, concurrency };
+}
+
+function createSummary(): OperationSummary {
+  return {
     totalScanned: 0,
-    totalMigrated: 0,
+    totalProcessed: 0,
+    skipped: 0,
     failures: 0,
     byType: new Map<string, number>(),
   };
+}
 
-  // progress bars
+function incrementType(summary: { byType: Map<string, number> }, type: string) {
+  summary.byType.set(type, (summary.byType.get(type) || 0) + 1);
+}
+
+async function produceKeys(
+  client: RedisClient,
+  pattern: string,
+  useScan: boolean,
+  onKey: (key: string) => void | Promise<void>,
+): Promise<number> {
+  let scanned = 0;
+
+  if (!useScan) {
+    logger.info(
+      "Using KEYS command (non-streaming). Be careful with large DBs.",
+    );
+    const keys = await client.keys(pattern);
+    for (const key of keys) {
+      scanned++;
+      await onKey(key);
+    }
+    return scanned;
+  }
+
+  logger.info(`Starting SCAN with pattern: ${pattern}`);
+  let cursor = "0";
+  do {
+    const result = await client.scan(cursor, {
+      MATCH: pattern,
+      COUNT: 1000,
+    });
+    cursor = result.cursor;
+    for (const key of result.keys) {
+      scanned++;
+      await onKey(key);
+    }
+  } while (cursor !== "0");
+
+  return scanned;
+}
+
+async function readRedisKey(
+  client: RedisClient,
+  key: string,
+): Promise<ExportRecord | null> {
+  const type = await client.type(key);
+  const ttl = await client.ttl(key);
+
+  if (ttl === -2 || type === "none") return null;
+
+  switch (type) {
+    case "string":
+      return {
+        version: 1,
+        key,
+        type,
+        ttl,
+        value: await client.get(key),
+      };
+    case "list":
+      return {
+        version: 1,
+        key,
+        type,
+        ttl,
+        value: await client.lRange(key, 0, -1),
+      };
+    case "hash":
+      return {
+        version: 1,
+        key,
+        type,
+        ttl,
+        value: await client.hGetAll(key),
+      };
+    case "set":
+      return {
+        version: 1,
+        key,
+        type,
+        ttl,
+        value: await client.sMembers(key),
+      };
+    case "zset":
+      return {
+        version: 1,
+        key,
+        type,
+        ttl,
+        value: await client.zRangeWithScores(key, 0, -1),
+      };
+    case "ReJSON-RL":
+      return {
+        version: 1,
+        key,
+        type,
+        ttl,
+        value: await client.json.get(key),
+      };
+    default:
+      logger.warn(`Unsupported type "${type}" for key "${key}"`);
+      return null;
+  }
+}
+
+function isEmptyCollection(record: ExportRecord): boolean {
+  if (record.type === "hash") return Object.keys(record.value).length === 0;
+  if (
+    record.type === "list" ||
+    record.type === "set" ||
+    record.type === "zset"
+  ) {
+    return record.value.length === 0;
+  }
+  return false;
+}
+
+async function restoreRedisKey(
+  client: RedisClient,
+  record: ExportRecord,
+  opts: { overwrite: boolean },
+): Promise<"restored" | "empty"> {
+  if (opts.overwrite) await client.del(record.key);
+
+  if (isEmptyCollection(record)) return "empty";
+
+  switch (record.type) {
+    case "string":
+      if (record.value !== null) await client.set(record.key, record.value);
+      break;
+    case "list":
+      await client.rPush(record.key, record.value);
+      break;
+    case "hash":
+      await client.hSet(record.key, record.value);
+      break;
+    case "set":
+      await client.sAdd(record.key, record.value);
+      break;
+    case "zset":
+      await client.zAdd(record.key, record.value);
+      break;
+    case "ReJSON-RL":
+      if (record.value !== null && record.value !== undefined) {
+        await client.json.set(
+          record.key,
+          "$",
+          record.value as Parameters<typeof client.json.set>[2],
+        );
+      }
+      break;
+  }
+
+  if (record.ttl > 0) await client.expire(record.key, record.ttl);
+  return "restored";
+}
+
+function parseExportRecord(value: unknown): ExportRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (record.version !== 1) return null;
+  if (typeof record.key !== "string") return null;
+  if (typeof record.ttl !== "number") return null;
+
+  switch (record.type) {
+    case "string":
+      if (typeof record.value !== "string" && record.value !== null)
+        return null;
+      return record as ExportRecord;
+    case "list":
+    case "set":
+      if (!Array.isArray(record.value)) return null;
+      if (!record.value.every((item) => typeof item === "string")) return null;
+      return record as ExportRecord;
+    case "hash":
+      if (!record.value || typeof record.value !== "object") return null;
+      if (
+        !Object.values(record.value).every((item) => typeof item === "string")
+      ) {
+        return null;
+      }
+      return record as ExportRecord;
+    case "zset":
+      if (!Array.isArray(record.value)) return null;
+      if (
+        !record.value.every(
+          (item) =>
+            item &&
+            typeof item === "object" &&
+            typeof (item as { value?: unknown }).value === "string" &&
+            typeof (item as { score?: unknown }).score === "number",
+        )
+      ) {
+        return null;
+      }
+      return record as ExportRecord;
+    case "ReJSON-RL":
+      return record as ExportRecord;
+    default:
+      return null;
+  }
+}
+
+function createProgressBars(actionName: string) {
   const multi = new MultiBar(
     {
       clearOnComplete: false,
@@ -216,248 +544,343 @@ async function migrateRedis(opts: CliOptions): Promise<void> {
     Presets.shades_classic,
   );
 
-  // If using KEYS (no scan), we will know total ahead of time.
-  let totalKeysKnown = 0;
-  let keysList: string[] | undefined;
-  if (!opts.useScan) {
-    logger.info(
-      "Using KEYS command (non-streaming). Be careful with large DBs.",
-    );
-    keysList = await sourceClient.keys(opts.keys);
-    totalKeysKnown = keysList.length;
-    logger.info(`Found ${totalKeysKnown} keys matching pattern.`);
-  }
-
-  // bars
-  const scannedBar = multi.create(100, 0, {
+  const scannedBar = multi.create(1, 0, {
     name: "scanned",
     msg: "scanning...",
   });
-  const migratedBar = multi.create(totalKeysKnown || 0, 0, {
-    name: "migrated",
+  const processedBar = multi.create(1, 0, {
+    name: actionName,
     msg: "",
   });
 
-  // If total unknown (SCAN), set total to a large placeholder so the bar still renders;
-  // we'll update the "total" via `setTotal` as we learn more if necessary.
-  if (!opts.useScan) {
-    scannedBar.setTotal(totalKeysKnown);
-  } else {
-    scannedBar.setTotal(1); // start with 1 so bar is visible (we will increment)
-    migratedBar.setTotal(1);
+  return { multi, scannedBar, processedBar };
+}
+
+async function runKeyWorkers(
+  concurrency: number,
+  queue: AsyncQueue<string>,
+  processKey: (key: string) => Promise<void>,
+): Promise<void> {
+  const workers: Promise<void>[] = [];
+  for (let i = 0; i < concurrency; i++) {
+    workers.push(
+      (async () => {
+        while (true) {
+          const key = await queue.shift();
+          if (key === null) break;
+          await processKey(key);
+        }
+      })(),
+    );
   }
+  await Promise.all(workers);
+}
 
-  // queue and workers
+function printOperationSummary(title: string, summary: OperationSummary): void {
+  logger.log(os.EOL);
+  logger.success(`${title} finished.`);
+  logger.log("Summary:");
+  logger.log(`  Total scanned : ${summary.totalScanned}`);
+  logger.log(`  Total processed: ${summary.totalProcessed}`);
+  logger.log(`  Skipped       : ${summary.skipped}`);
+  logger.log(`  Failures      : ${summary.failures}`);
+  logger.log("  By type:");
+  for (const [type, count] of summary.byType) {
+    logger.log(`    ${type}: ${count}`);
+  }
+}
+
+async function disconnect(client: RedisClient, name: string): Promise<void> {
+  try {
+    await client.disconnect();
+  } catch (error) {
+    logger.warn(`Error disconnecting ${name} client:`, error);
+  }
+}
+
+async function migrateRedis(opts: MigrateOptions): Promise<void> {
+  const sourceClient = redis.createClient({ url: opts.source });
+  const destinationClient = redis.createClient({ url: opts.dest });
+
+  sourceClient.on("error", (error) =>
+    logger.error("Source Redis error:", error),
+  );
+  destinationClient.on("error", (error) =>
+    logger.error("Destination Redis error:", error),
+  );
+
+  logger.info(`Connecting to source: ${opts.source}`);
+  logger.info(`Connecting to dest:   ${opts.dest}`);
+  await sourceClient.connect();
+  await destinationClient.connect();
+
+  const summary = createSummary();
   const queue = new AsyncQueue<string>();
+  const { multi, scannedBar, processedBar } = createProgressBars("migrated");
 
-  // Producer: either push all keys via KEYS or SCAN
   const producer = (async () => {
     try {
-      if (!opts.useScan && keysList) {
-        for (const k of keysList) {
-          queue.push(k);
-          summary.totalScanned++;
+      summary.totalScanned = await produceKeys(
+        sourceClient,
+        opts.keys,
+        opts.useScan,
+        (key) => {
+          queue.push(key);
           scannedBar.increment();
-        }
-        queue.close();
-        return;
-      }
-
-      // Use SCAN streaming
-      logger.info(`Starting SCAN with pattern: ${opts.keys}`);
-      let cursor = "0";
-      do {
-        // scan returns [newCursor, keys[]] when using client.scan
-        const res = await sourceClient.scan(cursor, {
-          MATCH: opts.keys,
-          COUNT: 1000,
-        });
-        const nextCursor = res.cursor as string;
-        const foundKeys = res.keys as string[];
-        for (const k of foundKeys) {
-          queue.push(k);
-          summary.totalScanned++;
-          // update bars
-          scannedBar.increment();
-          // if migrated bar total is 1 placeholder, increase it slowly to keep it playing
-          if (!opts.useScan) {
-            // no-op
-          } else {
-            // ensure progress bar total is at least scanned count
-            try {
-              migratedBar.setTotal(
-                Math.max(migratedBar.getTotal(), summary.totalScanned),
-              );
-            } catch {
-              // some cli-progress versions throw if setTotal smaller than current value etc.
-            }
-          }
-        }
-        cursor = nextCursor;
-      } while (cursor !== "0");
-      queue.close();
-    } catch (err) {
-      logger.error("Producer error during SCAN/KEYS:", err);
+          processedBar.setTotal(
+            Math.max(processedBar.getTotal(), summary.totalScanned + 1),
+          );
+        },
+      );
+    } catch (error) {
+      summary.failures++;
+      logger.error("Producer error during SCAN/KEYS:", error);
+    } finally {
       queue.close();
     }
   })();
 
-  // worker function
-  async function processKey(key: string) {
-    try {
-      const type = await sourceClient.type(key);
-      // increment per-type scanned
-      summary.byType.set(type, (summary.byType.get(type) || 0) + 1);
-
-      const ttl = await sourceClient.ttl(key); // seconds, -1 = persist, -2 = not found
-
-      switch (type) {
-        case "string": {
-          const value = await sourceClient.get(key);
-          // Properly call set with/without EX
-          if (ttl > 0) {
-            await destinationClient.set(key, value as string, { EX: ttl });
-          } else {
-            await destinationClient.set(key, value as string);
-          }
-          break;
+  await Promise.all([
+    producer,
+    runKeyWorkers(opts.concurrency, queue, async (key) => {
+      try {
+        const record = await readRedisKey(sourceClient, key);
+        if (!record) {
+          summary.skipped++;
+          return;
         }
-
-        case "list": {
-          const list = await sourceClient.lRange(key, 0, -1);
-          if (list && list.length > 0) {
-            await destinationClient.rPush(key, list);
-          } else {
-            // ensure empty list is created? skip
-          }
-          if (ttl > 0) await destinationClient.expire(key, ttl);
-          break;
-        }
-
-        case "hash": {
-          const hash = await sourceClient.hGetAll(key);
-          // hSet accepts object mapping
-          if (hash && Object.keys(hash).length > 0) {
-            await destinationClient.hSet(key, hash);
-          }
-          if (ttl > 0) await destinationClient.expire(key, ttl);
-          break;
-        }
-
-        case "set": {
-          const members = await sourceClient.sMembers(key);
-          if (members && members.length > 0) {
-            await destinationClient.sAdd(key, members);
-          }
-          if (ttl > 0) await destinationClient.expire(key, ttl);
-          break;
-        }
-
-        case "zset": {
-          // zRangeWithScores returns array of { value, score }
-          const z = await sourceClient.zRangeWithScores(key, 0, -1);
-          if (z && z.length > 0) {
-            // map to { score, value }
-            const zaddArgs = z.map((e: { value: string; score: number }) => ({
-              score: e.score,
-              value: e.value,
-            }));
-            // node-redis zAdd expects either { score, value } | Array
-            await destinationClient.zAdd(key, zaddArgs);
-          }
-          if (ttl > 0) await destinationClient.expire(key, ttl);
-          break;
-        }
-
-        case "ReJSON-RL": {
-          // RedisJSON (ReJSON) module value
-          const json = await sourceClient.json.get(key);
-
-          if (json !== null && json !== undefined) {
-            // Write entire document at root path "$"
-            await destinationClient.json.set(key, "$", json);
-          }
-
-          if (ttl > 0) await destinationClient.expire(key, ttl);
-
-          break;
-        }
-
-        default:
-          logger.warn(`Unsupported type "${type}" for key "${key}"`);
+        incrementType(summary, record.type);
+        await restoreRedisKey(destinationClient, record, { overwrite: false });
+        summary.totalProcessed++;
+        processedBar.increment();
+      } catch (error) {
+        summary.failures++;
+        logger.error(`Failed migrating key "${key}":`, error);
       }
+    }),
+  ]);
 
-      summary.totalMigrated++;
-      migratedBar.increment();
-    } catch (err) {
-      summary.failures++;
-      logger.error(`Failed migrating key "${key}":`, err);
-    }
-  }
-
-  // start worker pool
-  const workers: Promise<void>[] = [];
-  for (let i = 0; i < opts.concurrency; i++) {
-    const w = (async () => {
-      while (true) {
-        const k = await queue.shift();
-        if (k === null) break; // queue closed and drained
-        await processKey(k);
-      }
-    })();
-    workers.push(w);
-  }
-
-  // wait for producer and workers
-  await Promise.all([producer, ...workers]);
-
-  // stop progress bars
   multi.stop();
+  await disconnect(sourceClient, "source");
+  await disconnect(destinationClient, "destination");
+  printOperationSummary("Migration", summary);
+}
 
-  // disconnect
-  try {
-    await sourceClient.disconnect();
-  } catch (e) {
-    logger.warn("Error disconnecting source client:", e);
-  }
-  try {
-    await destinationClient.disconnect();
-  } catch (e) {
-    logger.warn("Error disconnecting destination client:", e);
-  }
-
-  // Print summary
-  logger.log(os.EOL);
-  logger.success(`Migration finished.`);
-  logger.log("Summary:");
-  logger.log(`  Total scanned : ${summary.totalScanned}`);
-  logger.log(`  Total migrated: ${summary.totalMigrated}`);
-  logger.log(`  Failures      : ${summary.failures}`);
-  logger.log("  By type:");
-  for (const [t, n] of summary.byType) {
-    logger.log(`    ${t}: ${n}`);
+async function writeNdjsonRecord(
+  stream: fs.WriteStream,
+  record: ExportRecord,
+): Promise<void> {
+  if (!stream.write(`${JSON.stringify(record)}\n`)) {
+    await once(stream, "drain");
   }
 }
 
-// ---------- Main ----------
+async function exportRedis(opts: ExportOptions): Promise<void> {
+  const stream = fs.createWriteStream(opts.output, { encoding: "utf8" });
+  await new Promise<void>((resolve, reject) => {
+    stream.once("open", () => resolve());
+    stream.once("error", reject);
+  });
+
+  const sourceClient = redis.createClient({ url: opts.source });
+  sourceClient.on("error", (error) =>
+    logger.error("Source Redis error:", error),
+  );
+
+  logger.info(`Connecting to source: ${opts.source}`);
+  logger.info(`Writing export:       ${opts.output}`);
+  await sourceClient.connect();
+
+  const summary = createSummary();
+  const queue = new AsyncQueue<string>();
+  const { multi, scannedBar, processedBar } = createProgressBars("exported");
+
+  const producer = (async () => {
+    try {
+      summary.totalScanned = await produceKeys(
+        sourceClient,
+        opts.keys,
+        opts.useScan,
+        (key) => {
+          queue.push(key);
+          scannedBar.increment();
+          processedBar.setTotal(
+            Math.max(processedBar.getTotal(), summary.totalScanned + 1),
+          );
+        },
+      );
+    } catch (error) {
+      summary.failures++;
+      logger.error("Producer error during SCAN/KEYS:", error);
+    } finally {
+      queue.close();
+    }
+  })();
+
+  let writeFailed = false;
+  stream.once("error", (error) => {
+    writeFailed = true;
+    logger.error("Export write stream failed:", error);
+  });
+
+  await Promise.all([
+    producer,
+    runKeyWorkers(opts.concurrency, queue, async (key) => {
+      if (writeFailed) return;
+      try {
+        const record = await readRedisKey(sourceClient, key);
+        if (!record) {
+          summary.skipped++;
+          return;
+        }
+        incrementType(summary, record.type);
+        await writeNdjsonRecord(stream, record);
+        summary.totalProcessed++;
+        processedBar.increment();
+      } catch (error) {
+        summary.failures++;
+        logger.error(`Failed exporting key "${key}":`, error);
+      }
+    }),
+  ]);
+
+  await new Promise<void>((resolve, reject) => {
+    stream.end((error?: Error | null) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+
+  multi.stop();
+  await disconnect(sourceClient, "source");
+  printOperationSummary("Export", summary);
+
+  if (writeFailed) {
+    throw new Error("Export failed because the output stream errored.");
+  }
+}
+
+async function restoreRedis(opts: RestoreOptions): Promise<void> {
+  await fs.promises.access(opts.input, fs.constants.R_OK);
+
+  const destinationClient = redis.createClient({ url: opts.dest });
+  destinationClient.on("error", (error) =>
+    logger.error("Destination Redis error:", error),
+  );
+
+  logger.info(`Connecting to dest: ${opts.dest}`);
+  logger.info(`Reading export:     ${opts.input}`);
+  await destinationClient.connect();
+
+  const summary: RestoreSummary = {
+    totalRecords: 0,
+    totalRestored: 0,
+    failures: 0,
+    skippedEmpty: 0,
+    byType: new Map<string, number>(),
+  };
+  const queue = new AsyncQueue<string>();
+
+  const workers = runKeyWorkers(opts.concurrency, queue, async (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    summary.totalRecords++;
+
+    try {
+      const record = parseExportRecord(JSON.parse(trimmed));
+      if (!record) {
+        summary.failures++;
+        logger.error(`Invalid export record on line ${summary.totalRecords}`);
+        return;
+      }
+
+      incrementType(summary, record.type);
+      const result = await restoreRedisKey(destinationClient, record, {
+        overwrite: true,
+      });
+      if (result === "empty") summary.skippedEmpty++;
+      else summary.totalRestored++;
+    } catch (error) {
+      summary.failures++;
+      logger.error(`Failed restoring line ${summary.totalRecords}:`, error);
+    }
+  });
+
+  const reader = readline.createInterface({
+    input: fs.createReadStream(opts.input, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+
+  for await (const line of reader) {
+    queue.push(line);
+  }
+  queue.close();
+  await workers;
+
+  await disconnect(destinationClient, "destination");
+
+  logger.log(os.EOL);
+  logger.success("Restore finished.");
+  logger.log("Summary:");
+  logger.log(`  Total records : ${summary.totalRecords}`);
+  logger.log(`  Total restored: ${summary.totalRestored}`);
+  logger.log(`  Empty skipped : ${summary.skippedEmpty}`);
+  logger.log(`  Failures      : ${summary.failures}`);
+  logger.log("  By type:");
+  for (const [type, count] of summary.byType) {
+    logger.log(`    ${type}: ${count}`);
+  }
+
+  if (summary.failures > 0) {
+    throw new Error("Restore completed with failures.");
+  }
+}
+
+function logStart(opts: CliOptions): void {
+  if (opts.command === "migrate") {
+    logger.info("Starting Redis migration");
+    logger.log(`  FROM: ${opts.source}`);
+    logger.log(`  TO:   ${opts.dest}`);
+    logger.log(`  PATTERN: ${opts.keys}`);
+    logger.log(`  CONCURRENCY: ${opts.concurrency}`);
+    logger.log(
+      `  MODE: ${opts.useScan ? "SCAN (streaming)" : "KEYS (one-shot)"}`,
+    );
+    logger.log();
+    return;
+  }
+
+  if (opts.command === "export") {
+    logger.info("Starting Redis export");
+    logger.log(`  FROM: ${opts.source}`);
+    logger.log(`  OUTPUT: ${opts.output}`);
+    logger.log(`  PATTERN: ${opts.keys}`);
+    logger.log(`  CONCURRENCY: ${opts.concurrency}`);
+    logger.log(
+      `  MODE: ${opts.useScan ? "SCAN (streaming)" : "KEYS (one-shot)"}`,
+    );
+    logger.log();
+    return;
+  }
+
+  logger.info("Starting Redis restore");
+  logger.log(`  TO: ${opts.dest}`);
+  logger.log(`  INPUT: ${opts.input}`);
+  logger.log(`  CONCURRENCY: ${opts.concurrency}`);
+  logger.log();
+}
+
 (async function main() {
   const opts = parseArgs(process.argv);
-
-  logger.info(`Starting Redis migration`);
-  logger.log(`  FROM: ${opts.source}`);
-  logger.log(`  TO:   ${opts.dest}`);
-  logger.log(`  PATTERN: ${opts.keys}`);
-  logger.log(`  CONCURRENCY: ${opts.concurrency}`);
-  logger.log(
-    `  MODE: ${opts.useScan ? "SCAN (streaming)" : "KEYS (one-shot)"}`,
-  );
-  logger.log();
+  logStart(opts);
 
   try {
-    await migrateRedis(opts);
+    if (opts.command === "migrate") await migrateRedis(opts);
+    else if (opts.command === "export") await exportRedis(opts);
+    else await restoreRedis(opts);
     process.exit(0);
-  } catch (err) {
-    logger.fatal("Migration failed:", err);
+  } catch (error) {
+    logger.fatal(`${opts.command} failed:`, error);
     process.exit(1);
   }
 })();
